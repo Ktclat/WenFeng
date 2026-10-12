@@ -3,6 +3,79 @@ import type { ParseResult } from "./types";
 const HOSTS = new Set(["douyin.com", "www.douyin.com", "v.douyin.com", "iesdouyin.com", "www.iesdouyin.com", "m.iesdouyin.com"]);
 const URL_PATTERN = /https?:\/\/[^\s<>"'(),\[\]，。！？；、（）【】《》「」『』\u3000]+/giu;
 const DIRECT_PATH = /^\/(?:share\/)?(video|note|slides)\/(\d{10,24})\/?$/u;
+const TOKEN_BLOCK = /##([A-Za-z0-9_-]{6,128})##[ \t]*(?:\[抖音口令\]|【抖音口令】)/gu;
+const TOKEN_END = /##([A-Za-z0-9_-]{6,128})##[ \t]*(?:\[抖音口令\]|【抖音口令】)[\s，。！!；;]*$/u;
+const TOKEN_PROMPT_END = /长按复制此条消息[，,：:\s]*打开抖音查看精彩(?:[:：]\/[ \t]*)?内容[，,。！!：:\s]*$/u;
+const COPY_PREFIX = /^\s*(?:[A-Za-z0-9@#$&*:.\/_=%+!\- \t]{0,100})?复制打开抖音[，,：:\s]*/u;
+const AUTHOR_PREFIX = /^\s*(?:[A-Za-z0-9@#$&*:.\/_=%+!\- \t]{0,100}复制打开抖音[，,：:\s]*)?看看【([^】\n]{1,80}?)(?:的作品|的图文|的视频)】\s*/u;
+
+function isShareTracking(text: string): boolean {
+  const value = text.trim();
+  const [marker, ...parts] = value.split(/\s+/u);
+  return value.length <= 100 && /^(?:\d{1,2}:\/|#\d{1,2}-)$/u.test(marker)
+    && parts.every(part => /^[A-Za-z0-9@._:/=%+\-]{1,25}$/u.test(part) && /[\d@._:/=%+\-]/u.test(part));
+}
+
+function removeTrailingTracking(text: string): string {
+  if (isShareTracking(text)) return "";
+  const suffix = text.match(/(?:^|\s)((?:\d{1,2}:\/|#\d{1,2}-)(?:\s+[A-Za-z0-9@._:/=%+\-]{1,25}){0,7})\s*$/u);
+  return suffix && isShareTracking(suffix[1]) ? text.slice(0, suffix.index).trimEnd() : text;
+}
+
+/** Only explicit, terminal Douyin token blocks are removed; quoted examples stay text. */
+function tokenTrailer(text: string): { content: string; token: string } | null {
+  const block = text.match(TOKEN_END);
+  if (!block) return null;
+  let before = text.slice(0, block.index).trimEnd();
+  const prompt = before.match(TOKEN_PROMPT_END);
+  if (!prompt && before.trim() && !isShareTracking(before) && !COPY_PREFIX.test(before) && !AUTHOR_PREFIX.test(before)) return null;
+  if (prompt) before = removeTrailingTracking(before.slice(0, prompt.index).trimEnd());
+  else if (isShareTracking(before)) before = "";
+  return { content: before, token: block[1] };
+}
+
+function removeSharePrefix(text: string, allowAuthor: boolean): { content: string; author: string } {
+  const author = allowAuthor ? text.match(AUTHOR_PREFIX) : null;
+  if (author) return { content: text.slice(author[0].length), author: author[1].trim() };
+  return { content: text.replace(COPY_PREFIX, ""), author: "" };
+}
+
+function singleTokenTrailer(text: string): { content: string; token: string } | null {
+  return text && text.length <= 24000 && [...text.matchAll(TOKEN_BLOCK)].length === 1 ? tokenTrailer(text.trim()) : null;
+}
+
+function isTokenShareList(text: string): boolean {
+  const blocks = [...text.matchAll(TOKEN_BLOCK)];
+  if (blocks.length < 2) return false;
+  let start = 0;
+  for (const block of blocks) {
+    const end = block.index! + block[0].length;
+    if (!tokenTrailer(text.slice(start, end))) return false;
+    start = end;
+  }
+  return /^[\s，。！!；;]*$/u.test(text.slice(start));
+}
+
+/** Stable identity survives later edits to the saved content or source URL. */
+export function shareTokenKey(originalShare: string): string | null {
+  const trailer = singleTokenTrailer(originalShare);
+  // The code is opaque and case-sensitive. It is not a work ID or a short URL.
+  return trailer ? JSON.stringify(["douyin-token", trailer.token]) : null;
+}
+
+/** Recognizes a complete opaque share token, never a bare number or random code. */
+export function isUnresolvedShareToken(text: string): boolean {
+  const trailer = singleTokenTrailer(text);
+  return !!trailer && !removeSharePrefix(trailer.content, true).content.trim();
+}
+
+/** Keep opaque token identities separate from empty-text titles in JSON backups. */
+export function textContentKey(note: { title: string; content: string; originalShare: string }): string {
+  if (!note.content.trim() && isUnresolvedShareToken(note.originalShare)) {
+    return shareTokenKey(note.originalShare)!;
+  }
+  return JSON.stringify(["text", note.title, note.content.trim()]);
+}
 
 export function workId(raw: string): string | null {
   try {
@@ -60,14 +133,17 @@ export function parseShare(input: string): ParseResult {
   if (unique.size > 1) throw new Error("检测到多条抖音链接，请一次粘贴一条分享内容。");
   if (matches.length && !unique.size) throw new Error("没有识别到抖音作品链接。请复制作品的分享内容，或切换到「直接摘录」。");
   const sourceUrl = [...unique.values()][0] || "";
-  let content = originalShare;
-  let author = "";
+  const trailer = tokenTrailer(originalShare);
+  if ((trailer && [...originalShare.matchAll(TOKEN_BLOCK)].length > 1) || isTokenShareList(originalShare)) {
+    throw new Error("检测到多条抖音口令，请一次粘贴一条完整分享内容。");
+  }
+  let content = trailer?.content ?? originalShare;
+  const isShare = !!sourceUrl || !!trailer || COPY_PREFIX.test(content);
+  const hasWrapper = isShare && AUTHOR_PREFIX.test(content);
+  const opening = isShare ? removeSharePrefix(content, true) : { content, author: "" };
+  content = opening.content;
+  const author = opening.author;
   if (sourceUrl) {
-    // Only a complete opening share wrapper may supply the author or remove a prefix.
-    const wrapper = content.match(/^\s*(?:[A-Za-z0-9@#$&*:.\/_=%+!\- \t]{0,100}复制打开抖音[，,：:\s]*)?看看【([^】\n]{1,80}?)(?:的作品|的图文|的视频)】\s*/u);
-    const hasWrapper = !!wrapper;
-    if (wrapper) { author = wrapper[1].trim();content = content.slice(wrapper[0].length); }
-    else content = content.replace(/^\s*(?:[A-Za-z0-9@#$&*:.\/_=%+!\- \t]{0,100})?复制打开抖音[，,：:\s]*/u, "");
     const contentMatches = [...content.matchAll(URL_PATTERN)].filter(match => !!douyinUrl(match[0]));
     // Remove links from right to left so surrounding user text remains intact.
     for (const match of contentMatches.reverse()) {
@@ -82,7 +158,11 @@ export function parseShare(input: string): ParseResult {
     content = content.split(/\r?\n/u).filter(line => !/^[\s，,。；;：（）()【】\[\]《》]*$/u.test(line)).join("\n");
   }
   content = content.replace(/\r\n/g,"\n").replace(/\n{3,}/g,"\n\n").trim();
-  return {title:makeTitle(content),content,author,sourceUrl,originalShare,tags:extractTags(content),status:content ? (sourceUrl ? "share" : "manual") : "link",notice:content ? (sourceUrl ? "已提取你粘贴的分享文案。分享文字可能只是节选，请核对后收藏。" : "已整理为文字摘录，可以继续编辑后收藏。") : "已识别到作品链接，正在尝试读取公开页面。"};
+  if (!content && !sourceUrl && trailer) {
+    return {title:"待解析的抖音口令",content:"",author,sourceUrl:"",originalShare,tags:[],status:"link",notice:"已识别到抖音口令，可以先保存为待整理；目前没有解析出文章。请在抖音中打开口令，再复制作品链接或手动补充正文。"};
+  }
+  if (!content && !sourceUrl) throw new Error("已识别到分享提示，但没有找到文案、作品链接或完整口令。请重新复制完整分享内容。");
+  return {title:makeTitle(content),content,author,sourceUrl,originalShare,tags:extractTags(content),status:content ? (isShare ? "share" : "manual") : "link",notice:content ? (isShare ? "已提取你粘贴的分享文案。分享文字可能只是节选，请核对后收藏。" : "已整理为文字摘录，可以继续编辑后收藏。") : "已识别到作品链接，正在尝试读取公开页面。"};
 }
 
 function decodeHtml(value: string): string {

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { douyinUrl } from "./parse-share";
+import { douyinUrl, isUnresolvedShareToken } from "./parse-share";
 
 export const noteInput = z.object({
   id: z.string().uuid(),
@@ -12,7 +12,7 @@ export const noteInput = z.object({
   tags: z.array(z.string().trim().min(1).max(30)).max(12).default([]),
   starred: z.boolean().default(false),
   status: z.enum(["share", "page", "manual", "link"]).default("manual"),
-}).refine(value => !!value.content.trim() || !!value.sourceUrl, "请补充正文或抖音作品链接");
+}).refine(value => !!value.content.trim() || !!value.sourceUrl || isUnresolvedShareToken(value.originalShare), "请补充正文或抖音作品链接，或粘贴完整的抖音口令");
 
 export function checkOrigin(request: Request): boolean {
   const origin = request.headers.get("origin");

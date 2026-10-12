@@ -10,7 +10,7 @@ createRoot(root).render(
   <StrictMode>
     <Notebook
       authenticated={true}
-      displayName="本地书房"
+      displayName="个人工作空间"
       storageMode="local"
       basePath={import.meta.env.BASE_URL}
     />

@@ -1,5 +1,5 @@
 import type { Draft, Note } from "./types";
-import { douyinUrl, sourceKey } from "./parse-share";
+import { douyinUrl, shareTokenKey, sourceKey, textContentKey } from "./parse-share";
 import { noteInput } from "./validation";
 
 export class LocalApiError extends Error {
@@ -69,24 +69,27 @@ function timestamp(value: unknown, fallback: number): number {
     : fallback;
 }
 
-function textKey(note: Pick<Note, "title" | "content">): string {
-  return JSON.stringify([note.title, note.content.trim()]);
-}
-
 function duplicateIndex(existing: readonly Note[]) {
   const ids = new Map<string, Note>();
   const sources = new Map<string, Note>();
   const texts = new Map<string, Note>();
+  const tokens = new Map<string, Note>();
   function add(note: Note) {
     if (!ids.has(note.id)) ids.set(note.id, note);
     if (note.sourceUrl && !sources.has(sourceKey(note.sourceUrl))) sources.set(sourceKey(note.sourceUrl), note);
-    if (!texts.has(textKey(note))) texts.set(textKey(note), note);
+    const text = textContentKey(note);
+    const token = shareTokenKey(note.originalShare);
+    if (!texts.has(text)) texts.set(text, note);
+    if (token && !tokens.has(token)) tokens.set(token, note);
   }
   existing.forEach(add);
   return {
     add,
-    find: (note: Draft) => ids.get(note.id)
-      || (note.sourceUrl ? sources.get(sourceKey(note.sourceUrl)) : texts.get(textKey(note))),
+    find: (note: Draft) => {
+      const token = shareTokenKey(note.originalShare);
+      return ids.get(note.id) || (token ? tokens.get(token) : undefined)
+        || (note.sourceUrl ? sources.get(sourceKey(note.sourceUrl)) : texts.get(textContentKey(note)));
+    },
   };
 }
 

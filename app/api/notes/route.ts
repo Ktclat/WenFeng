@@ -3,7 +3,7 @@ import { getDb } from "../../../db";
 import { notes } from "../../../db/schema";
 import { getChatGPTUser } from "../../chatgpt-auth";
 import { checkOrigin, noteInput, readBody } from "../../lib/validation";
-import { douyinUrl, sourceKey } from "../../lib/parse-share";
+import { douyinUrl, shareTokenKey, sourceKey, textContentKey } from "../../lib/parse-share";
 
 export const dynamic = "force-dynamic";
 type Row = typeof notes.$inferSelect;
@@ -47,7 +47,9 @@ export async function POST(request: Request) {
       if (!result.success) continue;
       const note = result.data;
       const canonical = note.sourceUrl ? douyinUrl(note.sourceUrl)! : "";
-      const duplicate = [...existing,...added].find(n => n.id === note.id || (canonical && n.sourceUrl && sourceKey(n.sourceUrl) === sourceKey(canonical)) || (!canonical && n.title === note.title && n.content.trim() === note.content.trim()));
+      const token = shareTokenKey(note.originalShare);
+      const text = textContentKey(note);
+      const duplicate = [...existing,...added].find(n => n.id === note.id || (token && shareTokenKey(n.originalShare) === token) || (canonical && n.sourceUrl && sourceKey(n.sourceUrl) === sourceKey(canonical)) || (!canonical && textContentKey(n) === text));
       if (duplicate) {
         if (isImport) { skipped++; continue; }
         return Response.json({error:duplicate.deletedAt ? "这条内容在回收站里，可以恢复收藏。" : "这条内容已经收藏过了。",note:present(duplicate)}, {status:409});
@@ -87,8 +89,10 @@ export async function PATCH(request: Request) {
     if (!parsed.success) return Response.json({error:parsed.error.issues[0]?.message || "请检查填写的内容。"}, {status:400});
     const {id,...note} = parsed.data;
     const canonical = note.sourceUrl ? douyinUrl(note.sourceUrl)! : "";
+    const token = shareTokenKey(note.originalShare);
+    const text = textContentKey(note);
     const existing = await db.select().from(notes).where(eq(notes.userId,user.userId));
-    const conflict = existing.find(n=>n.id!==id&&((canonical&&n.sourceUrl&&sourceKey(n.sourceUrl)===sourceKey(canonical))||(!canonical&&n.title===note.title&&n.content.trim()===note.content.trim())));
+    const conflict = existing.find(n=>n.id!==id&&((token&&shareTokenKey(n.originalShare)===token)||(canonical&&n.sourceUrl&&sourceKey(n.sourceUrl)===sourceKey(canonical))||(!canonical&&textContentKey(n)===text)));
     if(conflict)return Response.json({error:"另有一条相同来源或内容的收藏，请修改来源或查看已有收藏。",note:present(conflict)}, {status:409});
     const rows = await db.update(notes).set({...note,sourceUrl:note.sourceUrl ? douyinUrl(note.sourceUrl)! : "",tags:JSON.stringify([...new Set(note.tags)]),status:note.content.trim() ? (note.status === "link" ? "manual" : note.status) : "link",updatedAt:Date.now()}).where(and(eq(notes.id,id),eq(notes.userId,user.userId))).returning();
     if (!rows[0]) return Response.json({error:"没有找到这条收藏。"}, {status:404});

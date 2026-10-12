@@ -23,6 +23,18 @@ await compile("app/lib/local-note-operations.ts", "operations.mjs", { "./parse-s
 await compile("app/lib/local-api.ts", "local-api.mjs", { "./parse-share": "./parser.mjs", "./local-note-operations": "./operations.mjs" });
 const { localApi } = await import(pathToFileURL(resolve(dir, "local-api.mjs")));
 const { localNotesOperation, prepareLocalNotesOperation, LocalApiError } = await import(pathToFileURL(resolve(dir, "operations.mjs")));
+const { parseShare, isUnresolvedShareToken, shareTokenKey, textContentKey } = await import(pathToFileURL(resolve(dir, "parser.mjs")));
+
+// Publicly observed formats, not a claim that these opaque tokens are still valid:
+// https://www.douyin.com/shipin/7264272412638939190
+// https://www.douyin.com/shipin/7263567419669497913
+// The third variant was observed in the search index for:
+// https://www.douyin.com/video/7317213191006670132
+const PUBLIC_TOKENS = [
+  "9:/ 10/12 g@b.nd 长按复制此条消息，打开抖音查看精彩内容##onSv5CKloZ8##[抖音口令]",
+  "5:/ k@p.dA :5pm 05/31 长按复制此条消息，打开抖音查看精彩内容##tbK5XPeYG99##[抖音口令]",
+  "#7- 02/16 a@n.DU 长按复制此条消息，打开抖音查看精彩:/ 内容##VC5fEvSQwI8##[抖音口令]",
+];
 
 const clone = value => structuredClone(value);
 const nextTask = callback => setImmediate(callback);
@@ -187,6 +199,89 @@ try {
       assert.match(result.notice, /静态版不会抓取/);
       assert.doesNotMatch(result.notice, /正在尝试|已提取.*全文/);
     });
+    await t.test("真实形态的不透明口令保留原文，不冒充文章或标签", async () => {
+      for (const text of PUBLIC_TOKENS) {
+        const result = await localApi("/api/parse", "POST", { text });
+        assert.equal(result.title, "待解析的抖音口令");
+        assert.equal(result.content, "");
+        assert.equal(result.sourceUrl, "");
+        assert.equal(result.author, "");
+        assert.equal(result.originalShare, text);
+        assert.equal(result.status, "link");
+        assert.deepEqual(result.tags, []);
+        assert.equal(isUnresolvedShareToken(text), true);
+        assert.match(result.notice, /没有解析出文章/);
+        assert.match(result.notice, /复制作品链接或手动补充正文/);
+      }
+    });
+    await t.test("无 URL 的明确分享模板只提取文案，作者仅来自完整作者前缀", () => {
+      // Compatibility fixtures composed from the existing copy template and the
+      // observed token block; these are not asserted to be an official protocol.
+      const wrapped = "6.52 复制打开抖音，看看【阿青的作品】把日子过成喜欢的样子。 #生活 ##onSv5CKloZ8##[抖音口令]";
+      const result = parseShare(wrapped);
+      assert.equal(result.content, "把日子过成喜欢的样子。 #生活");
+      assert.equal(result.author, "阿青");
+      assert.equal(result.sourceUrl, "");
+      assert.equal(result.status, "share");
+      assert.deepEqual(result.tags, ["生活"]);
+      assert.equal(isUnresolvedShareToken(wrapped), false);
+      const described = parseShare(`让生活慢一点。 #爱喝茶的朋友请关注我\n${PUBLIC_TOKENS[0]}`);
+      assert.equal(described.content, "让生活慢一点。 #爱喝茶的朋友请关注我");
+      assert.equal(described.author, "");
+      assert.equal(described.status, "share");
+      const english = parseShare(`Email: me@example.com\n${PUBLIC_TOKENS[0]}`);
+      assert.equal(english.content, "Email: me@example.com");
+      const variant = parseShare(`Email: me@example.com\n${PUBLIC_TOKENS[2]}`);
+      assert.equal(variant.content, "Email: me@example.com");
+      assert.deepEqual(variant.tags, []);
+      const withoutToken = parseShare("6.52 复制打开抖音，看看【阿青的图文】今天也要慢慢长大。 #成长");
+      assert.equal(withoutToken.content, "今天也要慢慢长大。 #成长");
+      assert.equal(withoutToken.author, "阿青");
+      assert.equal(withoutToken.status, "share");
+    });
+    await t.test("普通短句、数字、随机码、Markdown 和英文笔记不会被当作口令", () => {
+      for (const text of [
+        "生活明朗，万物可爱。", "7000000000000000001", "onSv5CKloZ8",
+        "## Weekly notes\nKeep the original text.", "##onSv5CKloZ8##",
+        "English notes about copying and sharing.",
+        "用法示例：##onSv5CKloZ8##[抖音口令]",
+        "看看【阿青的作品】这只是我写的说明。",
+        "snssdk9999://aweme/detail/7000000000000000001",
+        "#7- 02/16 a@n.DU", "查看精彩:/ 内容",
+      ]) {
+        const result = parseShare(text);
+        assert.equal(isUnresolvedShareToken(text), false, text);
+        assert.equal(result.content, text, text);
+        assert.equal(result.sourceUrl, "", text);
+        assert.equal(result.author, "", text);
+        assert.equal(result.status, "manual", text);
+      }
+      assert.equal(isUnresolvedShareToken("长按复制此条消息，打开抖音查看精彩内容"), false);
+      assert.throws(() => parseShare(`${PUBLIC_TOKENS[0]}\n${PUBLIC_TOKENS[1]}`), /多条抖音口令/);
+    });
+    await t.test("多条裸口令与混合分享提示一次一条，引用示例仍是原文", () => {
+      const bare = "##onSv5CKloZ8##[抖音口令]\n##tbK5XPeYG99##[抖音口令]";
+      assert.throws(() => parseShare(bare), /多条抖音口令/);
+      assert.throws(() => parseShare(`${PUBLIC_TOKENS[0]}\n##tbK5XPeYG99##[抖音口令]`), /多条抖音口令/);
+      assert.equal(isUnresolvedShareToken(bare), false);
+      assert.equal(shareTokenKey(bare), null);
+      const quoted = "示例一：##onSv5CKloZ8##[抖音口令]\n示例二：##tbK5XPeYG99##[抖音口令]";
+      const result = parseShare(quoted);
+      assert.equal(result.content, quoted);
+      assert.equal(result.status, "manual");
+      assert.equal(result.sourceUrl, "");
+      assert.equal(shareTokenKey(quoted), null);
+    });
+    await t.test("原有带链接的分享清理和普通链接旁的正文保持不变", () => {
+      const wrapped = parseShare("6.52 复制打开抖音，看看【阿青的作品】把日子过成喜欢的样子。 #生活 https://v.douyin.com/AbCdEf12/ n@Q.uL 10/13 yUI:/");
+      assert.equal(wrapped.content, "把日子过成喜欢的样子。 #生活");
+      assert.equal(wrapped.author, "阿青");
+      assert.equal(wrapped.sourceUrl, "https://v.douyin.com/AbCdEf12/");
+      const unwrapped = parseShare("我喜欢这段文字（https://www.douyin.com/note/7000000000000000001）。\n尤其是最后一句。");
+      assert.equal(unwrapped.content, "我喜欢这段文字。\n尤其是最后一句。");
+      assert.equal(unwrapped.author, "");
+      assert.throws(() => parseShare("https://www.douyin.com/video/7000000000000000001?modal_id=7000000000000000002"), /没有识别到抖音作品链接/);
+    });
     await t.test("无效域名、多链接、空输入和过长内容保留错误", async () => {
       await assert.rejects(localApi("/api/parse", "POST", { text: "https://v.douyin.com.evil.test/abc" }), /没有识别到抖音/);
       await assert.rejects(localApi("/api/parse", "POST", { text: "https://v.douyin.com/abc/ https://v.douyin.com/def/" }), /多条抖音链接/);
@@ -198,6 +293,26 @@ try {
   });
 
   await test("纯收藏操作的导入、去重与容量边界", async t => {
+    await t.test("无正文口令按大小写敏感的码去重，普通文字仍按标题正文去重", () => {
+      const first = draft({ ...parseShare(PUBLIC_TOKENS[0]) });
+      const sameCode = draft({ ...first, id: crypto.randomUUID(), title: "换一个标题", originalShare: "##onSv5CKloZ8##【抖音口令】" });
+      const another = draft({ ...parseShare(PUBLIC_TOKENS[1]) });
+      const caseChanged = draft({ ...first, id: crypto.randomUUID(), originalShare: "##OnSv5CKloZ8##[抖音口令]" });
+      assert.equal(textContentKey(first), textContentKey(sameCode));
+      assert.notEqual(textContentKey(first), textContentKey(another));
+      assert.notEqual(textContentKey(first), textContentKey(caseChanged));
+      assert.equal(shareTokenKey(first.originalShare), shareTokenKey(sameCode.originalShare));
+      assert.notEqual(shareTokenKey(first.originalShare), shareTokenKey(caseChanged.originalShare));
+      assert.equal(shareTokenKey("onSv5CKloZ8"), null);
+      assert.equal(shareTokenKey("用法示例：##onSv5CKloZ8##[抖音口令]"), null);
+      const imported = localNotesOperation([], "POST", { notes: [first, sameCode, another, caseChanged] }, NOW);
+      assert.equal(imported.reply.skipped, 1);
+      assert.equal(imported.upserts.length, 3);
+      assert.equal(imported.upserts[0].originalShare, PUBLIC_TOKENS[0]);
+      assert.equal(imported.upserts[1].originalShare, PUBLIC_TOKENS[1]);
+      assert.equal(textContentKey(draft()), textContentKey(draft({ originalShare: PUBLIC_TOKENS[0] })));
+      assert.throws(() => localNotesOperation([], "POST", { note: draft({ content: "", originalShare: "onSv5CKloZ8" }) }, NOW), /正文或抖音/);
+    });
     await t.test("跨 video、note、slides 和 modal_id 的同一作品只保存一条", () => {
       const archived = stored({ sourceUrl: "https://www.douyin.com/video/7000000000000000001", deletedAt: NOW - 1 });
       const entries = [
@@ -268,6 +383,42 @@ try {
   });
 
   await test("真实适配器的 IndexedDB 事务边界与编辑流程", async t => {
+    await t.test("纯口令可以分别收藏、备份导入和删除恢复，补正文或链接后可继续整理", async () => {
+      install(new MemoryIndexedDB());
+      const first = (await localApi("/api/notes", "POST", { note: draft({ ...parseShare(PUBLIC_TOKENS[0]) }) })).notes[0];
+      const second = (await localApi("/api/notes", "POST", { note: draft({ ...parseShare(PUBLIC_TOKENS[1]) }) })).notes[0];
+      assert.equal(first.title, second.title);
+      assert.notEqual(first.id, second.id);
+      await assert.rejects(localApi("/api/notes", "POST", { note: draft({ ...parseShare("##onSv5CKloZ8##[抖音口令]"), title: "另起的标题" }) }), error => error.status === 409 && error.existing.id === first.id);
+      await assert.rejects(localApi("/api/notes", "PATCH", { note: { ...second, originalShare: "##onSv5CKloZ8##[抖音口令]" } }), error => error.status === 409 && error.existing.id === first.id);
+      const backup = JSON.parse(JSON.stringify((await localApi("/api/notes")).notes));
+      install(new MemoryIndexedDB());
+      const imported = await localApi("/api/notes", "POST", { notes: backup });
+      assert.equal(imported.notes.length, 2);
+      const recovered = imported.notes.find(note => note.id === first.id);
+      assert.equal(recovered.originalShare, PUBLIC_TOKENS[0]);
+      assert.equal(recovered.createdAt, first.createdAt);
+      assert.equal(recovered.updatedAt, first.updatedAt);
+      await localApi("/api/notes", "PATCH", { action: "trash", id: first.id });
+      const restored = (await localApi("/api/notes", "PATCH", { action: "restore", id: first.id })).note;
+      assert.equal(restored.originalShare, PUBLIC_TOKENS[0]);
+      assert.equal(restored.content, "");
+      assert.equal(restored.sourceUrl, "");
+      assert.equal(restored.deletedAt, null);
+      const edited = (await localApi("/api/notes", "PATCH", { note: { ...restored, content: "后来补上的正文。" } })).note;
+      assert.equal(edited.content, "后来补上的正文。");
+      assert.equal(edited.status, "manual");
+      const pastedAgain = draft({ ...parseShare("##onSv5CKloZ8##[抖音口令]"), title: "重新粘贴的口令" });
+      await assert.rejects(localApi("/api/notes", "POST", { note: pastedAgain }), error => error.status === 409 && error.existing.id === first.id);
+      await assert.rejects(localApi("/api/notes", "POST", { note: draft({ title: edited.title, content: edited.content }) }), error => error.status === 409 && error.existing.id === first.id);
+      assert.equal((await localApi("/api/notes", "POST", { notes: [pastedAgain] })).skipped, 1);
+      const linked = (await localApi("/api/notes", "PATCH", { note: { ...edited, sourceUrl: "https://www.douyin.com/note/7000000000000000001" } })).note;
+      assert.equal(linked.sourceUrl, "https://www.douyin.com/note/7000000000000000001");
+      assert.equal(linked.originalShare, PUBLIC_TOKENS[0]);
+      await assert.rejects(localApi("/api/notes", "POST", { note: pastedAgain }), error => error.status === 409 && error.existing.id === first.id);
+      await assert.rejects(localApi("/api/notes", "PATCH", { note: { ...second, content: "另一条补充文案", sourceUrl: "https://www.douyin.com/note/7000000000000000002", originalShare: first.originalShare } }), error => error.status === 409 && error.existing.id === first.id);
+      assert.equal((await localApi("/api/notes")).notes.length, 2);
+    });
     await t.test("重新建立数据库连接后仍读到收藏，返回对象不会改动已存内容", async () => {
       const factory = new MemoryIndexedDB(); install(factory);
       const input = { note: draft({ sourceUrl: "https://www.douyin.com/video/7000000000000000001?from=share", tags: ["文字", "文字"] }) };
